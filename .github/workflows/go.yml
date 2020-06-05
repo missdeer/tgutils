@@ -25,11 +25,12 @@ jobs:
     - name: Install tdlib
       run: |
         sudo apt-get update -y
+        sudo apt-get upgrade -y
         sudo apt-get install -y gperf
         git clone --depth 1 --recursive https://github.com/tdlib/td.git
         mkdir -p td/build
         cd td/build
-        cmake -DCMAKE_BUILD_TYPE=Release ..
+        cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ ..
         cmake --build . -- -j5
         make install
         cd -
