@@ -24,7 +24,7 @@ jobs:
 
     - name: Install tdlib
       run: |
-        git clone git@github.com:tdlib/td.git --depth 1
+        git clone --depth 1 --recursive https://github.com/tdlib/td.git
         mkdir -p td/build
         cd td/build
         cmake -DCMAKE_BUILD_TYPE=Release ..
