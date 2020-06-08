@@ -1,6 +1,8 @@
 package main
 
 import (
+	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"math"
@@ -8,20 +10,83 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/Arman92/go-tdlib"
+	"github.com/jinzhu/gorm"
+	_ "github.com/jinzhu/gorm/dialects/mysql"
+	_ "github.com/jinzhu/gorm/dialects/mssql"
+	_ "github.com/jinzhu/gorm/dialects/postgres"
 )
 
 var (
+	searchOnly          bool
+	largeGroupOnly      bool
+	dbDriver            string
+	dbConn              string
 	allChats            []*tdlib.Chat
 	haveFullChatList    bool
 	theChannelChatID    int64
 	theSupergroupChatID int64
 	theChannelID        int32
 	theSupergroupID     int32
+	db                  *gorm.DB
 )
 
+const limit int32 = 200
+
+type TGUser struct {
+	gorm.Model
+	UserID   int32  `gorm:"unique;index;not null"`
+	UserName string `gorm:"type:varchar(255)"`
+}
+
+func userExists(userID int32) bool {
+	u := &TGUser{UserID: userID}
+	err := db.Where("user_id = ?", userID).First(u).Error
+	return !gorm.IsRecordNotFoundError(err)
+}
+
+func insertUser(userID int32, userName string) error {
+	u := &TGUser{UserID: userID, UserName: userName}
+	err := db.Create(u).Error
+	return err
+}
+
+func insertUserIfNotExists(client *tdlib.Client, userID int32) error {
+	user, err := client.GetUser(userID)
+	if err != nil {
+		log.Println("can't get user info:", err)
+		return err
+	}
+
+	if userExists(userID) {
+		return errors.New("User exists")
+	}
+
+	if err = insertUser(userID, user.Username); err != nil {
+		log.Println("insert user failed", err)
+		return err
+	}
+	return nil
+}
+
 func main() {
+	flag.StringVar(&dbDriver, "driver", "", "database driver, such as mysql, sqlite, postgres, mssql")
+	flag.StringVar(&dbConn, "connection", "", "database connection string, for example: root:password7@tcp(192.168.233.1:3306)/dbname?charset=utf8mb4&parseTime=True&loc=Local")
+	flag.BoolVar(&largeGroupOnly, "largeGroupOnly", largeGroupOnly, "large group (member count > 10000) only, or it will search all groups")
+	flag.BoolVar(&searchOnly, "searchOnly", searchOnly, "search only, or it will get recent 10000 members")
+	flag.Parse()
+
+	var err error
+	if db, err = gorm.Open(dbDriver, dbConn); err != nil {
+		log.Fatal("failed to connect database", err)
+	}
+	defer db.Close()
+
+	// Migrate the schema
+	db.AutoMigrate(&TGUser{})
+
 	tdlib.SetLogVerbosityLevel(1)
 	tdlib.SetFilePath("./errors.txt")
 
@@ -83,6 +148,7 @@ func main() {
 		}
 	}
 
+	fmt.Println("authorized")
 	// get at most 1000 chats list
 	getChatList(client, 1000)
 	fmt.Printf("got %d chats\n", len(allChats))
@@ -101,21 +167,6 @@ func main() {
 				break
 			}
 			fmt.Print("super group:", chat.Title, group.MemberCount, group.Username, chat.ID)
-			if group.IsChannel {
-				fmt.Println("\tit's a channel")
-				if strings.HasPrefix(chat.Title, `唯美和美食不可辜负-`) {
-					theChannelChatID = chat.ID
-					theChannelID = spChat.SupergroupID
-					getSupergroupMemebers(client, theChannelID)
-				}
-			} else {
-				fmt.Println("\tit's not a channel")
-				if strings.HasPrefix(chat.Title, `唯美和美食不可辜负-`) {
-					theSupergroupChatID = chat.ID
-					theSupergroupID = spChat.SupergroupID
-					getSupergroupMemebers(client, theSupergroupID)
-				}
-			}
 			fullInfo, err := client.GetSupergroupFullInfo(spChat.SupergroupID)
 			if err != nil {
 				log.Println("can't get super group full info", err)
@@ -123,8 +174,39 @@ func main() {
 			}
 			if !fullInfo.CanGetMembers {
 				log.Println("can't get members from this group", chat.Title)
+				break
 			}
-
+			if group.IsChannel {
+				fmt.Println("\tit's a channel")
+				if strings.HasPrefix(chat.Title, `唯美和美食不可辜负-`) {
+					theChannelChatID = chat.ID
+					theChannelID = spChat.SupergroupID
+				} else {
+					if !searchOnly {
+						if fullInfo.MemberCount > 10000 || !largeGroupOnly {
+							getSupergroupMemebers(client, spChat.SupergroupID)
+						}
+					}
+					if fullInfo.MemberCount > 10000 {
+						getChatMembers(client, chat.ID)
+					}
+				}
+			} else {
+				fmt.Println("\tit's not a channel")
+				if strings.HasPrefix(chat.Title, `唯美和美食不可辜负-`) {
+					theSupergroupChatID = chat.ID
+					theSupergroupID = spChat.SupergroupID
+				} else {
+					if !searchOnly {
+						if fullInfo.MemberCount > 10000 || !largeGroupOnly {
+							getSupergroupMemebers(client, spChat.SupergroupID)
+						}
+					}
+					if fullInfo.MemberCount > 10000 {
+						getChatMembers(client, chat.ID)
+					}
+				}
+			}
 		case tdlib.ChatTypeBasicGroupType:
 			basicChat, ok := chat.Type.(*tdlib.ChatTypeBasicGroup)
 			if !ok {
@@ -148,19 +230,117 @@ func main() {
 			}
 		}
 	}
+
+	rawUpdates := client.GetRawUpdatesChannel(100)
+	for update := range rawUpdates {
+		// Show all updates
+		fmt.Println(update.Data)
+		t, ok := update.Data["@type"]
+		if !ok {
+			continue
+		}
+		msgType, ok := t.(string)
+		if !ok {
+			continue
+		}
+
+		if msgType == "updateUserStatus" {
+			id, ok := update.Data["user_id"]
+			if !ok {
+				continue
+			}
+
+			senderUserID, ok := id.(int32)
+			if !ok {
+				continue
+			}
+
+			insertUserIfNotExists(client, senderUserID)
+			continue
+		}
+
+		if msgType != "updateNewMessage" && msgType != "updateChatLastMessage" {
+			continue
+		}
+		c, ok := update.Data["content"]
+		if !ok {
+			continue
+		}
+
+		content, ok := c.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		id, ok := content["sender_user_id"]
+		if !ok {
+			continue
+		}
+
+		senderUserID, ok := id.(int32)
+		if !ok {
+			continue
+		}
+
+		insertUserIfNotExists(client, senderUserID)
+	}
+}
+
+func addMembers(client *tdlib.Client, m *tdlib.ChatMembers) error {
+	if m.TotalCount == 0 || len(m.Members) == 0 {
+		log.Println("got 0 members")
+		return errors.New("no members")
+	}
+	fmt.Println("total count:", m.TotalCount, ", got member count:", len(m.Members))
+	for _, member := range m.Members {
+		user, err := client.GetUser(member.UserID)
+		if err != nil {
+			log.Println("can't get user info:", err)
+			continue
+		}
+		if userExists(member.UserID) {
+			continue
+		}
+		if err := insertUser(member.UserID, user.Username); err != nil {
+			log.Println("insert user failed", err)
+		}
+	}
+	return nil
+}
+
+func getChatMembers(client *tdlib.Client, chatID int64) {
+	str := `0123456789abcdefghijklmnopqrstuvwxyz`
+	var filter tdlib.ChatMembersFilter
+	for _, ch := range str {
+		searchStr := fmt.Sprintf("%c", ch)
+		m, err := client.SearchChatMembers(chatID, searchStr, limit, filter)
+		if err != nil {
+			log.Println("getting supergroup member failed", err)
+			continue
+		}
+
+		if err = addMembers(client, m); err != nil {
+			log.Println("", err)
+		}
+		time.Sleep(time.Duration(len(m.Members)/60+1) * time.Second)
+	}
 }
 
 func getSupergroupMemebers(client *tdlib.Client, supergroupID int32) {
 	var offset int32 = 0
-	var limit int32 = 200
 	var filter tdlib.SupergroupMembersFilter
-	m, err:=client.GetSupergroupMembers(supergroupID, filter, offset, limit)
-	if err != nil {
-		log.Println("getting supergroup member failed", err)
-		return
-	}
-	for _, member := range m.Members{
-		fmt.Println("find a member:", member.UserID)
+	for ; ; offset += limit {
+		m, err := client.GetSupergroupMembers(supergroupID, filter, offset, limit)
+		if err != nil {
+			log.Println("getting supergroup member failed", err)
+			break
+		}
+
+		if err = addMembers(client, m); err != nil {
+			log.Println("", err)
+			break
+		}
+		time.Sleep(time.Duration(len(m.Members)/60+1) * time.Second)
 	}
 }
 
